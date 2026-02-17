@@ -9,18 +9,21 @@ Allows the LLM to bind specific URDFs to action command topics.
 import multiprocessing
 import re
 import tempfile
+import time
 import numpy as np
 import xml.etree.ElementTree as ET
 from ikpy.chain import Chain
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
 from sensor_msgs.msg import JointState
-from std_msgs.msg import Float64MultiArray
+from std_msgs.msg import Float64MultiArray, String
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from mcp.server.fastmcp import FastMCP
 
 _CONTROL_PROCESS = None
+_CONTROL_TOPIC_PROCESS = None
 mcp = FastMCP("robomcp-control")
 
 # --- ROS Logic ---
@@ -191,6 +194,238 @@ def _ros_worker(urdf_path: str, cartesian_cmd_topic: str, state_feedback_topic: 
         node.destroy_node()
         rclpy.shutdown()
 
+class AutoIKNodeWithURDFSubscriber(Node):
+    """
+    ROS2 Node for real-time IK calculation with URDF loaded from topic.
+    
+    Subscribes to:
+    - /robot_description (or custom topic) for URDF XML string
+    - Robot joint state feedback (JointState)
+    - End-effector Cartesian delta commands (Float64MultiArray)
+    
+    Publishes:
+    - Joint trajectory commands (JointTrajectory) OR JointState commands
+    """
+    def __init__(self, urdf_topic: str, cartesian_cmd_topic: str, state_feedback_topic: str, 
+                 joint_cmd_topic: str, cmd_msg_type: str = "JointTrajectory", timeout: float = 10.0):
+        super().__init__('auto_ik_node_with_urdf_sub')
+        
+        self.cmd_msg_type = cmd_msg_type
+        self.urdf_received = False
+        self.chain = None
+        self.gripper_joints = []
+        self.current_joints = {}
+        self.ik_mask = []
+        self.active_joint_names = []
+        
+        self.get_logger().info(f'Waiting for URDF on topic: {urdf_topic}')
+        
+        # QoS profile matching /robot_description publisher
+        # TRANSIENT_LOCAL is critical - ensures late subscribers receive the URDF
+        urdf_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10
+        )
+        
+        # Subscribe to URDF topic
+        self.urdf_sub = self.create_subscription(
+            String,
+            urdf_topic,
+            self.urdf_callback,
+            urdf_qos
+        )
+        
+        # Wait for URDF with timeout
+        start_time = time.time()
+        while not self.urdf_received and (time.time() - start_time) < timeout:
+            rclpy.spin_once(self, timeout_sec=0.1)
+        
+        if not self.urdf_received:
+            raise RuntimeError(f"Timeout waiting for URDF on {urdf_topic} after {timeout}s")
+        
+        self.get_logger().info(f'URDF received, initializing controller...')
+        self.get_logger().info(f'Subscribing to Cartesian commands on: {cartesian_cmd_topic}')
+        self.get_logger().info(f'Subscribing to Joint States on: {state_feedback_topic}')
+        self.get_logger().info(f'Publishing {self.cmd_msg_type} to: {joint_cmd_topic}')
+        
+        # Create subscriptions for control
+        self.create_subscription(JointState, state_feedback_topic, self.state_cb, 10)
+        self.create_subscription(Float64MultiArray, cartesian_cmd_topic, self.cmd_cb, 10)
+        
+        # Conditional Publisher creation
+        if self.cmd_msg_type == "JointState":
+            self.pub_cmd = self.create_publisher(JointState, joint_cmd_topic, 10)
+        else:
+            self.pub_cmd = self.create_publisher(JointTrajectory, joint_cmd_topic, 10)
+    
+    def urdf_callback(self, msg: String):
+        """Process URDF XML from topic and initialize IK chain."""
+        if self.urdf_received:
+            return  # Already initialized
+        
+        urdf_content = msg.data
+        
+        if not urdf_content or '<robot' not in urdf_content:
+            self.get_logger().warn('Received invalid URDF (no <robot> tag)')
+            return
+        
+        try:
+            # Parse URDF XML
+            root = ET.fromstring(urdf_content)
+            link_parent_map = {}
+            link_names = set()
+            detected_gripper_joints = []
+            
+            for joint in root.findall('joint'):
+                name = joint.get('name')
+                parent_elem = joint.find('parent')
+                child_elem = joint.find('child')
+                
+                if parent_elem is not None and child_elem is not None:
+                    parent = parent_elem.get('link')
+                    child = child_elem.get('link')
+                    link_names.add(parent)
+                    link_names.add(child)
+                    link_parent_map[child] = parent
+                    
+                    if joint.get('type') == 'prismatic' or 'finger' in (name.lower() if name else ''):
+                        detected_gripper_joints.append(name)
+            
+            base_link_name = list(link_names - set(link_parent_map.keys()))[0]
+            
+            # Strip visual and collision elements for ikpy
+            xml_str = re.sub(r'<visual>.*?</visual>', '', urdf_content, flags=re.DOTALL)
+            xml_str = re.sub(r'<collision>.*?</collision>', '', xml_str, flags=re.DOTALL)
+            
+            # Save to temp file for ikpy
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.urdf', delete=False) as tmp:
+                tmp.write(xml_str)
+                clean_urdf_path = tmp.name
+            
+            self.chain = Chain.from_urdf_file(clean_urdf_path, base_elements=[base_link_name])
+            self.gripper_joints = detected_gripper_joints
+            
+            # Determine active joints
+            for link in self.chain.links:
+                if link.joint_type == 'fixed' or link.name == base_link_name:
+                    self.ik_mask.append(False)
+                else:
+                    self.ik_mask.append(True)
+                    self.active_joint_names.append(link.name)
+            
+            self.urdf_received = True
+            self.get_logger().info('URDF processed successfully, controller ready')
+            
+        except Exception as e:
+            self.get_logger().error(f'Failed to process URDF: {e}')
+    
+    def state_cb(self, msg):
+        """Processes incoming JointState messages and updates the current joint positions."""
+        for name, pos in zip(msg.name, msg.position):
+            self.current_joints[name] = pos
+    
+    def cmd_cb(self, msg):
+        """
+        Receives Cartesian command deltas, calculates IK, and publishes the result.
+        """
+        if not self.urdf_received or self.chain is None:
+            return
+        
+        if not self.current_joints:
+            return
+        
+        # 1. Construct bounded initial position for IK
+        current_ik_q = [0.0] * len(self.chain.links)
+        for i, link in enumerate(self.chain.links):
+            min_limit, max_limit = link.bounds
+            q = 0.0
+            
+            if link.name in self.current_joints:
+                q = self.current_joints[link.name]
+            
+            if min_limit is not None and max_limit is not None:
+                q = np.clip(q, min_limit, max_limit)
+            
+            current_ik_q[i] = q
+        
+        # 2. Calculate target pose
+        current_pose = self.chain.forward_kinematics(current_ik_q)
+        dx, dy, dz, dr, dp, dy_aw, grip_cmd = msg.data
+        
+        # RPY Matrix construction
+        cx, sx = np.cos(dr), np.sin(dr)
+        cy, sy = np.cos(dp), np.sin(dp)
+        cz, sz = np.cos(dy_aw), np.sin(dy_aw)
+        R = np.array([[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]]) @ \
+            np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]]) @ \
+            np.array([[1, 0, 0], [0, cx, -sx], [0, sx, cx]])
+        
+        delta_pose = np.eye(4)
+        delta_pose[:3, 3] = [dx, dy, dz]
+        delta_pose[:3, :3] = R
+        target_pose = current_pose @ delta_pose
+        
+        # 3. Solve IK
+        try:
+            target_ik_q = self.chain.inverse_kinematics_frame(
+                target_pose,
+                initial_position=current_ik_q,
+                orientation_mode='all'
+            )
+        except Exception as e:
+            self.get_logger().error(f"IK failed: {e}")
+            return
+        
+        # Prepare joint names and positions
+        final_joint_names = self.active_joint_names + self.gripper_joints
+        
+        active_positions = []
+        for i, link in enumerate(self.chain.links):
+            if i < len(self.ik_mask) and self.ik_mask[i]:
+                active_positions.append(target_ik_q[i])
+        
+        gripper_positions = [grip_cmd * 0.04] * len(self.gripper_joints)
+        final_positions = active_positions + gripper_positions
+        
+        # 4. Package and Publish message
+        if self.cmd_msg_type == "JointState":
+            out_msg = JointState()
+            out_msg.header.stamp = self.get_clock().now().to_msg()
+            out_msg.name = final_joint_names
+            out_msg.position = final_positions
+            self.pub_cmd.publish(out_msg)
+        else:
+            out_msg = JointTrajectory()
+            out_msg.header.stamp = self.get_clock().now().to_msg()
+            out_msg.joint_names = final_joint_names
+            
+            point = JointTrajectoryPoint()
+            point.positions = final_positions
+            point.time_from_start.sec = 0
+            point.time_from_start.nanosec = 500000000
+            
+            out_msg.points.append(point)
+            self.pub_cmd.publish(out_msg)
+
+def _ros_worker_with_urdf_topic(urdf_topic: str, cartesian_cmd_topic: str, state_feedback_topic: str, 
+                                 joint_cmd_topic: str, cmd_msg_type: str, timeout: float):
+    """Worker function to run AutoIKNodeWithURDFSubscriber in a separate process."""
+    rclpy.init()
+    node = None
+    try:
+        node = AutoIKNodeWithURDFSubscriber(urdf_topic, cartesian_cmd_topic, state_feedback_topic, 
+                                            joint_cmd_topic, cmd_msg_type, timeout)
+        rclpy.spin(node)
+    except (KeyboardInterrupt, Exception):
+        pass
+    finally:
+        if node is not None:
+            node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
 # --- MCP Tools ---
 @mcp.tool()
 def start_controller(urdf_path: str, 
@@ -255,6 +490,65 @@ def stop_controller() -> str:
         _CONTROL_PROCESS.join(timeout=1.0)
     _CONTROL_PROCESS = None
     return "Success: Controller stopped."
+
+@mcp.tool()
+def start_controller_from_topic(urdf_topic: str = "/robot_description",
+                                cartesian_cmd_topic: str = "/ee_command",
+                                state_feedback_topic: str = "/isaac_joint_states",
+                                joint_cmd_topic: str = "/isaac_joint_commands",
+                                cmd_msg_type: str = "JointTrajectory",
+                                timeout: float = 10.0) -> str:
+    """
+    [ACTION/CONTROL] Starts the IK controller by subscribing to robot URDF from a ROS topic.
+    
+    This is an alternative to start_controller() that doesn't require a URDF file path.
+    Instead, it subscribes to a ROS topic (typically /robot_description) where simulators
+    or robot drivers publish the robot's URDF description.
+    
+    Role in VLA Task: Same as start_controller() - must run before VLA inference node.
+    Advantage: Works seamlessly with simulators that auto-publish URDF to /robot_description.
+    
+    Args:
+        urdf_topic: Topic publishing URDF as std_msgs/String (default: /robot_description).
+        cartesian_cmd_topic: [Input Topic] Where IK controller listens for EE commands (default: /ee_command).
+        state_feedback_topic: Topic providing robot joint state feedback (default: /isaac_joint_states).
+        joint_cmd_topic: Topic for publishing joint commands to robot (default: /isaac_joint_commands).
+        cmd_msg_type: Output message type - "JointTrajectory" or "JointState" (default: "JointTrajectory").
+        timeout: Seconds to wait for URDF from topic before failing (default: 10.0).
+    """
+    global _CONTROL_TOPIC_PROCESS
+    if _CONTROL_TOPIC_PROCESS is not None and _CONTROL_TOPIC_PROCESS.is_alive():
+        return "Error: Controller from topic is already running."
+    
+    if cmd_msg_type not in ["JointTrajectory", "JointState"]:
+        return "Error: cmd_msg_type must be 'JointTrajectory' or 'JointState'."
+    
+    ctx = multiprocessing.get_context('spawn')
+    _CONTROL_TOPIC_PROCESS = ctx.Process(
+        target=_ros_worker_with_urdf_topic,
+        args=(urdf_topic, cartesian_cmd_topic, state_feedback_topic, joint_cmd_topic, cmd_msg_type, timeout),
+        daemon=False
+    )
+    _CONTROL_TOPIC_PROCESS.start()
+    return f"Success: Controller started from topic {urdf_topic} (pid={_CONTROL_TOPIC_PROCESS.pid}, type={cmd_msg_type})."
+
+@mcp.tool()
+def stop_controller_from_topic() -> str:
+    """Stops the IK controller that was started from a URDF topic."""
+    global _CONTROL_TOPIC_PROCESS
+    if _CONTROL_TOPIC_PROCESS is None or not _CONTROL_TOPIC_PROCESS.is_alive():
+        return "Info: No topic-based controller is running."
+    
+    _CONTROL_TOPIC_PROCESS.terminate()
+    _CONTROL_TOPIC_PROCESS.join(timeout=5.0)
+    if _CONTROL_TOPIC_PROCESS.is_alive():
+        try:
+            _CONTROL_TOPIC_PROCESS.kill()
+        except Exception:
+            pass
+        _CONTROL_TOPIC_PROCESS.join(timeout=1.0)
+    _CONTROL_TOPIC_PROCESS = None
+    return "Success: Topic-based controller stopped."
 
 if __name__ == "__main__":
     import argparse

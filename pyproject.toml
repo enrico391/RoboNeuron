@@ -4,6 +4,14 @@ version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.10.12"
-dependencies = []
+dependencies = [
+    "numpy",
+    "mcp",
+    "ikpy",
+    "pillow>=12.1.1",
+    "torch>=2.10.0",
+    "json-numpy>=2.1.1",
+    "transformers>=5.2.0",
+]
 [tool.setuptools]
 packages = ["wrapper", "vla_src", "converter", "mcptool_lib"]
