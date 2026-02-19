@@ -7,6 +7,7 @@ Subscribes to /robot_description topic and provides URDF access to other service
 """
 
 import multiprocessing
+import multiprocessing.managers
 import os
 import tempfile
 import rclpy
@@ -18,11 +19,26 @@ import sys
 import argparse
 import time
 import select
+import threading
+from typing import Any
 
 # Global storage for the background process
-_URDF_PROCESS = None
-# Shared memory for URDF content
-_URDF_CACHE = multiprocessing.Manager().dict() if multiprocessing.current_process().name == 'MainProcess' else {}
+_URDF_PROCESS: Any = None
+_MP_CONTEXT = multiprocessing.get_context('spawn')
+# Shared memory manager and cache (lazy initialization)
+_CACHE_MANAGER: Any = None
+_URDF_CACHE: Any = None
+_CACHE_LOCK = threading.Lock()
+
+
+def _get_cache() -> Any:
+    """Lazily initialize and return the shared URDF cache dict."""
+    global _CACHE_MANAGER, _URDF_CACHE
+    with _CACHE_LOCK:
+        if _URDF_CACHE is None:
+            _CACHE_MANAGER = _MP_CONTEXT.Manager()
+            _URDF_CACHE = _CACHE_MANAGER.dict()
+        return _URDF_CACHE
 
 mcp = FastMCP("robomcp-urdf")
 
@@ -94,20 +110,16 @@ def start_urdf_subscriber(topic: str = "/robot_description") -> str:
     Args:
         topic: The ROS topic publishing the URDF as a String message (default: /robot_description).
     """
-    global _URDF_PROCESS, _URDF_CACHE
+    global _URDF_PROCESS
     
     if _URDF_PROCESS is not None and _URDF_PROCESS.is_alive():
         return "Error: URDF subscriber is already running."
     
-    # Initialize cache manager if needed
-    if not isinstance(_URDF_CACHE, dict) or not hasattr(_URDF_CACHE, '_manager'):
-        _URDF_CACHE = multiprocessing.Manager().dict()
+    cache = _get_cache()
     
-    # Use 'spawn' to avoid fork-related rclpy issues
-    ctx = multiprocessing.get_context('spawn')
-    _URDF_PROCESS = ctx.Process(
+    _URDF_PROCESS = _MP_CONTEXT.Process(
         target=_ros_worker,
-        args=(topic, _URDF_CACHE),
+        args=(topic, cache),
         daemon=False
     )
     _URDF_PROCESS.start()
@@ -142,12 +154,12 @@ def get_urdf() -> str:
     Returns:
         The URDF XML content as a string, or an error message if unavailable.
     """
-    global _URDF_CACHE
+    cache = _get_cache()
     
-    if 'urdf' not in _URDF_CACHE:
+    if 'urdf' not in cache:
         return "Error: No URDF available. Ensure start_urdf_subscriber() has been called and the topic is publishing."
     
-    return _URDF_CACHE['urdf']
+    return cache['urdf']
 
 @mcp.tool()
 def save_urdf_to_file(filepath: str) -> str:
@@ -163,19 +175,18 @@ def save_urdf_to_file(filepath: str) -> str:
     Returns:
         Success message with file path, or error if URDF is unavailable.
     """
-    global _URDF_CACHE
+    cache = _get_cache()
     
-    if 'urdf' not in _URDF_CACHE:
+    if 'urdf' not in cache:
         return "Error: No URDF available. Call start_urdf_subscriber() first."
     
     try:
-        # Create directory if it doesn't exist
         os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
         
         with open(filepath, 'w') as f:
-            f.write(_URDF_CACHE['urdf'])
+            f.write(cache['urdf'])
         
-        return f"Success: URDF saved to {filepath} ({len(_URDF_CACHE['urdf'])} bytes)."
+        return f"Success: URDF saved to {filepath} ({len(cache['urdf'])} bytes)."
     except Exception as e:
         return f"Error: Failed to save URDF to {filepath}: {e}"
 
@@ -190,15 +201,14 @@ def get_temp_urdf_path() -> str:
     Returns:
         Temporary file path containing the URDF, or error if unavailable.
     """
-    global _URDF_CACHE
+    cache = _get_cache()
     
-    if 'urdf' not in _URDF_CACHE:
+    if 'urdf' not in cache:
         return "Error: No URDF available. Call start_urdf_subscriber() first."
     
     try:
-        # Create a named temporary file that persists after closing
         with tempfile.NamedTemporaryFile(mode='w', suffix='.urdf', delete=False) as tmp:
-            tmp.write(_URDF_CACHE['urdf'])
+            tmp.write(cache['urdf'])
             tmp_path = tmp.name
         
         return f"Success: {tmp_path}"
@@ -213,11 +223,10 @@ def urdf_status() -> str:
     Returns information about whether the subscriber is running, if URDF data
     has been received, and when it was last updated.
     """
-    global _URDF_PROCESS, _URDF_CACHE
+    global _URDF_PROCESS
     
     status_lines = []
     
-    # Check process status
     if _URDF_PROCESS is None:
         status_lines.append("Subscriber Status: Not started")
     elif _URDF_PROCESS.is_alive():
@@ -225,10 +234,10 @@ def urdf_status() -> str:
     else:
         status_lines.append("Subscriber Status: Stopped")
     
-    # Check cache status
-    if 'urdf' in _URDF_CACHE:
-        urdf_size = len(_URDF_CACHE['urdf'])
-        timestamp = _URDF_CACHE.get('timestamp', 'unknown')
+    cache = _get_cache()
+    if 'urdf' in cache:
+        urdf_size = len(cache['urdf'])
+        timestamp = cache.get('timestamp', 'unknown')
         status_lines.append(f"URDF Cache: Available ({urdf_size} bytes)")
         status_lines.append(f"Last Updated: {time.ctime(timestamp) if isinstance(timestamp, (int, float)) else timestamp}")
     else:
