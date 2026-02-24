@@ -4,12 +4,11 @@ urdf_mcp.py
 
 MCP Server for managing robot URDF descriptions from ROS topics.
 Subscribes to /robot_description topic and provides URDF access to other services.
-
-File-based persistence implementation - works across MCP server restarts.
 """
 
+import multiprocessing
+import multiprocessing.managers
 import os
-import json
 import tempfile
 import rclpy
 from rclpy.node import Node
@@ -21,50 +20,38 @@ import argparse
 import time
 import select
 import threading
+from typing import Any
 
-# File-based cache path
-_CACHE_FILE = "/tmp/urdf_cache.json"
-_cache_lock = threading.Lock()
-
-# ROS process handle
-_ROS_PROCESS = None
-_ROS_PROCESS_LOCK = threading.Lock()
-
-
-def _load_cache() -> dict:
-    """Load cache from file if exists."""
-    with _cache_lock:
-        if os.path.exists(_CACHE_FILE):
-            try:
-                with open(_CACHE_FILE, 'r') as f:
-                    return json.load(f)
-            except (json.JSONDecodeError, IOError):
-                pass
-        return {"urdf": None, "timestamp": None}
+# Global storage for the background process
+_URDF_PROCESS: Any = None
+_MP_CONTEXT = multiprocessing.get_context('spawn')
+# Shared memory manager and cache (lazy initialization)
+_CACHE_MANAGER: Any = None
+_URDF_CACHE: Any = None
+_CACHE_LOCK = threading.Lock()
 
 
-def _save_cache(cache: dict) -> None:
-    """Persist cache to file."""
-    with _cache_lock:
-        try:
-            with open(_CACHE_FILE, 'w') as f:
-                json.dump(cache, f)
-        except IOError as e:
-            pass  # Silent fail on write errors
-
+def _get_cache() -> Any:
+    """Lazily initialize and return the shared URDF cache dict."""
+    global _CACHE_MANAGER, _URDF_CACHE
+    with _CACHE_LOCK:
+        if _URDF_CACHE is None:
+            _CACHE_MANAGER = _MP_CONTEXT.Manager()
+            _URDF_CACHE = _CACHE_MANAGER.dict()
+        return _URDF_CACHE
 
 mcp = FastMCP("robomcp-urdf")
 
 # --- ROS Logic ---
-
 
 class URDFSubscriberNode(Node):
     """
     ROS2 Node that subscribes to /robot_description topic and caches URDF content.
     Uses TRANSIENT_LOCAL durability to receive URDF from late-joining subscribers.
     """
-    def __init__(self, topic: str):
+    def __init__(self, topic: str, cache_dict: dict):
         super().__init__('urdf_subscriber_node')
+        self.cache = cache_dict
         
         # QoS profile matching /robot_description publisher
         # TRANSIENT_LOCAL is critical - ensures late subscribers receive the URDF
@@ -86,26 +73,22 @@ class URDFSubscriberNode(Node):
     def urdf_callback(self, msg: String):
         """
         Callback when URDF is received from the topic.
-        Stores the URDF XML string in shared cache file.
+        Stores the URDF XML string in shared cache.
         """
         urdf_content = msg.data
         if urdf_content and '<robot' in urdf_content:
-            cache = _load_cache()
-            cache['urdf'] = urdf_content
-            cache['timestamp'] = time.time()
-            _save_cache(cache)
+            self.cache['urdf'] = urdf_content
+            self.cache['timestamp'] = time.time()
             self.get_logger().info(f'URDF received and cached ({len(urdf_content)} bytes)')
         else:
             self.get_logger().warn('Received invalid URDF (no <robot> tag)')
 
-
-# ROS worker - runs in a separate thread (not process)
-def _ros_worker(topic: str):
-    """Worker function to run the URDF subscriber node."""
+def _ros_worker(topic: str, cache_dict: dict):
+    """Worker function to run the URDF subscriber node in a separate process."""
     rclpy.init()
-    node = URDFSubscriberNode(topic)
+    node = URDFSubscriberNode(topic, cache_dict)
     try:
-        rclpy.spin(node)
+        rclpy.spin_once(node)
     except (KeyboardInterrupt, Exception):
         pass
     finally:
@@ -113,9 +96,7 @@ def _ros_worker(topic: str):
         if rclpy.ok():
             rclpy.shutdown()
 
-
 # --- MCP Tools ---
-
 
 @mcp.tool()
 def start_urdf_subscriber(topic: str = "/robot_description") -> str:
@@ -129,40 +110,38 @@ def start_urdf_subscriber(topic: str = "/robot_description") -> str:
     Args:
         topic: The ROS topic publishing the URDF as a String message (default: /robot_description).
     """
-    global _ROS_PROCESS
+    global _URDF_PROCESS
     
-    with _ROS_PROCESS_LOCK:
-        if _ROS_PROCESS is not None and _ROS_PROCESS.is_alive():
-            return "Error: URDF subscriber is already running."
-        
-        # Start ROS worker in a daemon thread
-        _ROS_PROCESS = threading.Thread(target=_ros_worker, args=(topic,), daemon=True)
-        _ROS_PROCESS.start()
-        
-        # Give it a moment to initialize
-        time.sleep(0.5)
-        
-        return f"Success: URDF subscriber started on {topic}."
-
+    if _URDF_PROCESS is not None and _URDF_PROCESS.is_alive():
+        return "Error: URDF subscriber is already running."
+    
+    cache = _get_cache()
+    
+    _URDF_PROCESS = _MP_CONTEXT.Process(
+        target=_ros_worker,
+        args=(topic, cache),
+        daemon=False
+    )
+    _URDF_PROCESS.start()
+    return f"Success: URDF subscriber started on {topic} (pid={_URDF_PROCESS.pid})."
 
 @mcp.tool()
 def stop_urdf_subscriber() -> str:
     """Stops the URDF subscriber node."""
-    global _ROS_PROCESS
+    global _URDF_PROCESS
+    if _URDF_PROCESS is None or not _URDF_PROCESS.is_alive():
+        return "Info: No URDF subscriber is running."
     
-    with _ROS_PROCESS_LOCK:
-        if _ROS_PROCESS is None or not _ROS_PROCESS.is_alive():
-            return "Info: No URDF subscriber is running."
-    
-    # Note: Thread termination is tricky in Python
-    # We can only signal the thread to stop, not force-kill it
-    # The rclpy.spin will eventually exit when the node is destroyed
-    # For a cleaner shutdown, we could use threading.Event
-    
-    # For now, just mark as stopped - the thread will exit on next spin iteration
-    _ROS_PROCESS = None
-    return "Success: URDF subscriber stopped (will exit on next iteration)."
-
+    _URDF_PROCESS.terminate()
+    _URDF_PROCESS.join(timeout=5.0)
+    if _URDF_PROCESS.is_alive():
+        try:
+            _URDF_PROCESS.kill()
+        except Exception:
+            pass
+        _URDF_PROCESS.join(timeout=1.0)
+    _URDF_PROCESS = None
+    return "Success: URDF subscriber stopped."
 
 @mcp.tool()
 def get_urdf() -> str:
@@ -175,13 +154,12 @@ def get_urdf() -> str:
     Returns:
         The URDF XML content as a string, or an error message if unavailable.
     """
-    cache = _load_cache()
+    cache = _get_cache()
     
-    if not cache.get('urdf'):
+    if 'urdf' not in cache:
         return "Error: No URDF available. Ensure start_urdf_subscriber() has been called and the topic is publishing."
     
     return cache['urdf']
-
 
 @mcp.tool()
 def save_urdf_to_file(filepath: str) -> str:
@@ -197,13 +175,13 @@ def save_urdf_to_file(filepath: str) -> str:
     Returns:
         Success message with file path, or error if URDF is unavailable.
     """
-    cache = _load_cache()
+    cache = _get_cache()
     
-    if not cache.get('urdf'):
+    if 'urdf' not in cache:
         return "Error: No URDF available. Call start_urdf_subscriber() first."
     
     try:
-        os.makedirs(os.path.dirname(os.path.abspath(filepath)) or '.', exist_ok=True)
+        os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
         
         with open(filepath, 'w') as f:
             f.write(cache['urdf'])
@@ -211,7 +189,6 @@ def save_urdf_to_file(filepath: str) -> str:
         return f"Success: URDF saved to {filepath} ({len(cache['urdf'])} bytes)."
     except Exception as e:
         return f"Error: Failed to save URDF to {filepath}: {e}"
-
 
 @mcp.tool()
 def get_temp_urdf_path() -> str:
@@ -224,9 +201,9 @@ def get_temp_urdf_path() -> str:
     Returns:
         Temporary file path containing the URDF, or error if unavailable.
     """
-    cache = _load_cache()
+    cache = _get_cache()
     
-    if not cache.get('urdf'):
+    if 'urdf' not in cache:
         return "Error: No URDF available. Call start_urdf_subscriber() first."
     
     try:
@@ -238,7 +215,6 @@ def get_temp_urdf_path() -> str:
     except Exception as e:
         return f"Error: Failed to create temporary URDF file: {e}"
 
-
 @mcp.tool()
 def urdf_status() -> str:
     """
@@ -247,20 +223,19 @@ def urdf_status() -> str:
     Returns information about whether the subscriber is running, if URDF data
     has been received, and when it was last updated.
     """
-    global _ROS_PROCESS
+    global _URDF_PROCESS
     
     status_lines = []
     
-    with _ROS_PROCESS_LOCK:
-        if _ROS_PROCESS is None:
-            status_lines.append("Subscriber Status: Not started")
-        elif _ROS_PROCESS.is_alive():
-            status_lines.append("Subscriber Status: Running (thread)")
-        else:
-            status_lines.append("Subscriber Status: Stopped")
+    if _URDF_PROCESS is None:
+        status_lines.append("Subscriber Status: Not started")
+    elif _URDF_PROCESS.is_alive():
+        status_lines.append(f"Subscriber Status: Running (pid={_URDF_PROCESS.pid})")
+    else:
+        status_lines.append("Subscriber Status: Stopped")
     
-    cache = _load_cache()
-    if cache.get('urdf'):
+    cache = _get_cache()
+    if 'urdf' in cache:
         urdf_size = len(cache['urdf'])
         timestamp = cache.get('timestamp', 'unknown')
         status_lines.append(f"URDF Cache: Available ({urdf_size} bytes)")
@@ -269,7 +244,6 @@ def urdf_status() -> str:
         status_lines.append("URDF Cache: Empty (waiting for data)")
     
     return "\n".join(status_lines)
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="urdf_mcp.py local test harness")
@@ -280,9 +254,8 @@ if __name__ == "__main__":
     if args.local_test:
         print("LOCAL TEST MODE: starting URDF subscriber...")
         
-        # Clear any existing cache
-        if os.path.exists(_CACHE_FILE):
-            os.remove(_CACHE_FILE)
+        # Initialize shared cache for local test
+        _URDF_CACHE = multiprocessing.Manager().dict()
         
         res = start_urdf_subscriber(args.topic)
         print(res)
@@ -295,6 +268,11 @@ if __name__ == "__main__":
             
             while True:
                 time.sleep(0.5)
+                
+                # Check if process is alive
+                if _URDF_PROCESS is None or not _URDF_PROCESS.is_alive():
+                    print("Subscriber process exited.")
+                    break
                 
                 # Check for user input
                 if sys.stdin in select.select([sys.stdin], [], [], 0)[0]:
