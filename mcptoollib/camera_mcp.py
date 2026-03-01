@@ -12,9 +12,12 @@ as fresh as possible.
 """
 
 import base64
+import io
 import json
 import threading
 import time
+
+from PIL import Image
 
 import rclpy
 from rclpy.node import Node
@@ -34,6 +37,8 @@ from mcp.server.fastmcp import FastMCP
 mcp = FastMCP("camera-mcp")
 
 _DEFAULT_TOPIC = "/camera0/camera/color/image_raw/compressed"
+_DEFAULT_MAX_WIDTH = 640
+_DEFAULT_MAX_HEIGHT = 480
 
 # ---------------------------------------------------------------------------
 # ROS 2 subscriber node (lives for the entire server lifetime)
@@ -121,27 +126,63 @@ _init_ros()
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _resize_and_encode(
+    data: bytes,
+    max_width: int = _DEFAULT_MAX_WIDTH,
+    max_height: int = _DEFAULT_MAX_HEIGHT,
+) -> tuple[str, tuple[int, int], tuple[int, int]]:
+    """
+    Decode raw CompressedImage bytes, resize to fit within max_width x max_height
+    (preserving aspect ratio), re-encode as JPEG, and return:
+      (base64_string, original_size, resized_size)
+    """
+    img = Image.open(io.BytesIO(data))
+    original_size = img.size  # (width, height)
+
+    img.thumbnail((max_width, max_height), Image.LANCZOS)
+    resized_size = img.size
+
+    buf = io.BytesIO()
+    img.convert("RGB").save(buf, format="JPEG", quality=85)
+    img_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    return img_b64, original_size, resized_size
+
+
+# ---------------------------------------------------------------------------
 # MCP Tools
 # ---------------------------------------------------------------------------
 
 
 @mcp.tool()
-def get_camera_image(topic: str = _DEFAULT_TOPIC) -> str:
+def get_camera_image(
+    topic: str = _DEFAULT_TOPIC,
+    max_width: int = _DEFAULT_MAX_WIDTH,
+    max_height: int = _DEFAULT_MAX_HEIGHT,
+) -> str:
     """
     [PERCEPTION/INFO] Capture the latest camera image as a base64-encoded string.
 
-    Subscribes to the given ROS 2 topic (sensor_msgs/CompressedImage) and
-    returns the most recent frame.  The response includes:
-      - format     : compression format reported by the publisher (e.g. "jpeg")
-      - base64     : the image data encoded as a base64 string
-      - size_bytes : original compressed size in bytes
-      - topic      : the source topic
+    Subscribes to the given ROS 2 topic (sensor_msgs/CompressedImage), resizes
+    the frame to fit within max_width x max_height (preserving aspect ratio),
+    and returns it as JPEG base64.  The response includes:
+      - format          : always "jpeg" after resize
+      - base64          : the resized image encoded as a base64 string
+      - original_size   : {width, height} of the frame before resize
+      - resized_size    : {width, height} after resize
+      - size_bytes      : byte size of the resized JPEG
+      - topic           : the source topic
 
     The underlying ROS node remains alive for the server lifetime.
     Every call performs a short spin to capture any freshly published frame.
 
     Args:
-        topic: The ROS 2 topic publishing sensor_msgs/CompressedImage.
+        topic      : The ROS 2 topic publishing sensor_msgs/CompressedImage.
+        max_width  : Maximum output width in pixels (default: 640).
+        max_height : Maximum output height in pixels (default: 480).
     """
     global _ros_node
 
@@ -164,13 +205,17 @@ def get_camera_image(topic: str = _DEFAULT_TOPIC) -> str:
             indent=2,
         )
 
-    img_b64 = base64.b64encode(msg.data).decode("ascii")
+    img_b64, original_size, resized_size = _resize_and_encode(
+        msg.data, max_width, max_height
+    )
 
     return json.dumps(
         {
             "topic": topic,
-            "format": msg.format,
-            "size_bytes": len(msg.data),
+            "format": "jpeg",
+            "original_size": {"width": original_size[0], "height": original_size[1]},
+            "resized_size": {"width": resized_size[0], "height": resized_size[1]},
+            "size_bytes": len(base64.b64decode(img_b64)),
             "base64": img_b64,
         },
         indent=2,

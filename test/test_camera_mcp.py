@@ -20,6 +20,7 @@ import threading
 import time
 import types
 from unittest import mock
+import io
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -141,8 +142,29 @@ def camera_mcp():
 # Helpers: build fake CompressedImage messages
 # ---------------------------------------------------------------------------
 
-SAMPLE_JPEG_DATA = b"\xff\xd8\xff\xe0" + b"\x00" * 100  # minimal JPEG-like bytes
-SAMPLE_PNG_DATA = b"\x89PNG\r\n\x1a\n" + b"\x00" * 80   # minimal PNG-like bytes
+# ---------------------------------------------------------------------------
+# Helpers: generate minimal real JPEG/PNG bytes using Pillow
+# (real Pillow is installed; no need to stub it)
+# ---------------------------------------------------------------------------
+
+try:
+    from PIL import Image as _PILImage
+    def _make_jpeg_bytes(width: int = 800, height: int = 600) -> bytes:
+        buf = io.BytesIO()
+        _PILImage.new("RGB", (width, height), color=(100, 150, 200)).save(buf, format="JPEG")
+        return buf.getvalue()
+    def _make_png_bytes(width: int = 800, height: int = 600) -> bytes:
+        buf = io.BytesIO()
+        _PILImage.new("RGB", (width, height), color=(200, 100, 50)).save(buf, format="PNG")
+        return buf.getvalue()
+    SAMPLE_JPEG_DATA = _make_jpeg_bytes(800, 600)   # larger than 640x480 -> will be resized
+    SAMPLE_JPEG_DATA_SMALL = _make_jpeg_bytes(320, 240)  # already fits -> no resize
+    SAMPLE_PNG_DATA = _make_png_bytes(800, 600)
+except ImportError:
+    # Fallback if Pillow is somehow unavailable (keeps stubs working)
+    SAMPLE_JPEG_DATA = b"\xff\xd8\xff\xe0" + b"\x00" * 100
+    SAMPLE_JPEG_DATA_SMALL = SAMPLE_JPEG_DATA
+    SAMPLE_PNG_DATA = b"\x89PNG\r\n\x1a\n" + b"\x00" * 80
 
 
 def _make_compressed_image(
@@ -236,24 +258,36 @@ class TestInitRos:
 class TestGetCameraImage:
 
     def test_returns_base64_encoded_image(self, camera_mcp):
+        """Output base64 should be whatever _resize_and_encode returns."""
         mock_node = MagicMock()
         mock_node._topic = camera_mcp._DEFAULT_TOPIC
         mock_node.get_latest.return_value = SAMPLE_IMAGE
 
+        fake_b64 = base64.b64encode(b"fake-resized-jpeg").decode("ascii")
         with patch.object(camera_mcp, "_ros_node", mock_node), \
+             patch.object(camera_mcp, "_resize_and_encode",
+                          return_value=(fake_b64, (800, 600), (640, 450))) as mock_resize, \
              patch("time.sleep"):
             raw = camera_mcp.get_camera_image()
 
+        mock_resize.assert_called_once_with(
+            SAMPLE_IMAGE.data,
+            camera_mcp._DEFAULT_MAX_WIDTH,
+            camera_mcp._DEFAULT_MAX_HEIGHT,
+        )
         data = json.loads(raw)
-        decoded = base64.b64decode(data["base64"])
-        assert decoded == SAMPLE_JPEG_DATA
+        assert data["base64"] == fake_b64
 
     def test_returns_correct_format(self, camera_mcp):
+        """format field must always be 'jpeg' after resize."""
         mock_node = MagicMock()
         mock_node._topic = camera_mcp._DEFAULT_TOPIC
         mock_node.get_latest.return_value = SAMPLE_IMAGE
 
+        fake_b64 = base64.b64encode(b"x").decode("ascii")
         with patch.object(camera_mcp, "_ros_node", mock_node), \
+             patch.object(camera_mcp, "_resize_and_encode",
+                          return_value=(fake_b64, (800, 600), (640, 450))), \
              patch("time.sleep"):
             raw = camera_mcp.get_camera_image()
 
@@ -261,23 +295,31 @@ class TestGetCameraImage:
         assert data["format"] == "jpeg"
 
     def test_returns_size_bytes(self, camera_mcp):
+        """size_bytes must reflect the resized JPEG byte count, not the raw input."""
         mock_node = MagicMock()
         mock_node._topic = camera_mcp._DEFAULT_TOPIC
         mock_node.get_latest.return_value = SAMPLE_IMAGE
 
+        resized_payload = b"resized-jpeg-bytes"
+        fake_b64 = base64.b64encode(resized_payload).decode("ascii")
         with patch.object(camera_mcp, "_ros_node", mock_node), \
+             patch.object(camera_mcp, "_resize_and_encode",
+                          return_value=(fake_b64, (800, 600), (640, 450))), \
              patch("time.sleep"):
             raw = camera_mcp.get_camera_image()
 
         data = json.loads(raw)
-        assert data["size_bytes"] == len(SAMPLE_JPEG_DATA)
+        assert data["size_bytes"] == len(resized_payload)
 
     def test_returns_topic_in_output(self, camera_mcp):
         mock_node = MagicMock()
         mock_node._topic = camera_mcp._DEFAULT_TOPIC
         mock_node.get_latest.return_value = SAMPLE_IMAGE
 
+        fake_b64 = base64.b64encode(b"x").decode("ascii")
         with patch.object(camera_mcp, "_ros_node", mock_node), \
+             patch.object(camera_mcp, "_resize_and_encode",
+                          return_value=(fake_b64, (800, 600), (640, 450))), \
              patch("time.sleep"):
             raw = camera_mcp.get_camera_image()
 
@@ -309,18 +351,23 @@ class TestGetCameraImage:
         assert camera_mcp._DEFAULT_TOPIC in data["error"]
 
     def test_handles_png_format(self, camera_mcp):
+        """PNG input is always re-encoded to JPEG by _resize_and_encode."""
         png_image = _make_compressed_image(fmt="png", data=SAMPLE_PNG_DATA)
         mock_node = MagicMock()
         mock_node._topic = camera_mcp._DEFAULT_TOPIC
         mock_node.get_latest.return_value = png_image
 
+        fake_b64 = base64.b64encode(b"jpeg-from-png").decode("ascii")
         with patch.object(camera_mcp, "_ros_node", mock_node), \
+             patch.object(camera_mcp, "_resize_and_encode",
+                          return_value=(fake_b64, (800, 600), (640, 450))), \
              patch("time.sleep"):
             raw = camera_mcp.get_camera_image()
 
         data = json.loads(raw)
-        assert data["format"] == "png"
-        assert base64.b64decode(data["base64"]) == SAMPLE_PNG_DATA
+        # format is always "jpeg" after resize/re-encode
+        assert data["format"] == "jpeg"
+        assert data["base64"] == fake_b64
 
     def test_reinitializes_node_on_topic_change(self, camera_mcp):
         """When a different topic is requested the node should be re-initialized."""
@@ -340,7 +387,10 @@ class TestGetCameraImage:
         mock_node._topic = camera_mcp._DEFAULT_TOPIC
         mock_node.get_latest.return_value = SAMPLE_IMAGE
 
+        fake_b64 = base64.b64encode(b"x").decode("ascii")
         with patch.object(camera_mcp, "_ros_node", mock_node), \
+             patch.object(camera_mcp, "_resize_and_encode",
+                          return_value=(fake_b64, (800, 600), (640, 450))), \
              patch("time.sleep"):
             raw = camera_mcp.get_camera_image()
 
@@ -353,13 +403,100 @@ class TestGetCameraImage:
         mock_node._topic = camera_mcp._DEFAULT_TOPIC
         mock_node.get_latest.return_value = SAMPLE_IMAGE
 
+        fake_b64 = base64.b64encode(b"x").decode("ascii")
         with patch.object(camera_mcp, "_ros_node", mock_node), \
+             patch.object(camera_mcp, "_resize_and_encode",
+                          return_value=(fake_b64, (800, 600), (640, 450))), \
              patch("time.sleep"):
             raw = camera_mcp.get_camera_image()
 
         data = json.loads(raw)
         data["base64"].encode("ascii")  # Must not raise
 
+    def test_returns_original_and_resized_size(self, camera_mcp):
+        """Response must include original_size and resized_size dicts."""
+        mock_node = MagicMock()
+        mock_node._topic = camera_mcp._DEFAULT_TOPIC
+        mock_node.get_latest.return_value = SAMPLE_IMAGE
+
+        fake_b64 = base64.b64encode(b"x").decode("ascii")
+        with patch.object(camera_mcp, "_ros_node", mock_node), \
+             patch.object(camera_mcp, "_resize_and_encode",
+                          return_value=(fake_b64, (800, 600), (640, 450))), \
+             patch("time.sleep"):
+            raw = camera_mcp.get_camera_image()
+
+        data = json.loads(raw)
+        assert data["original_size"] == {"width": 800, "height": 600}
+        assert data["resized_size"] == {"width": 640, "height": 450}
+
+    def test_passes_max_width_height_to_resize(self, camera_mcp):
+        """max_width and max_height params must be forwarded to _resize_and_encode."""
+        mock_node = MagicMock()
+        mock_node._topic = camera_mcp._DEFAULT_TOPIC
+        mock_node.get_latest.return_value = SAMPLE_IMAGE
+
+        fake_b64 = base64.b64encode(b"x").decode("ascii")
+        with patch.object(camera_mcp, "_ros_node", mock_node), \
+             patch.object(camera_mcp, "_resize_and_encode",
+                          return_value=(fake_b64, (800, 600), (320, 240))) as mock_resize, \
+             patch("time.sleep"):
+            camera_mcp.get_camera_image(max_width=320, max_height=240)
+
+        mock_resize.assert_called_once_with(SAMPLE_IMAGE.data, 320, 240)
+
+
+# ---------------------------------------------------------------------------
+# Tests: _resize_and_encode (pure function, no ROS needed)
+# ---------------------------------------------------------------------------
+
+class TestResizeAndEncode:
+    """Tests for the _resize_and_encode helper.  Real Pillow is used."""
+
+    def test_returns_tuple_of_three(self, camera_mcp):
+        result = camera_mcp._resize_and_encode(SAMPLE_JPEG_DATA)
+        assert isinstance(result, tuple) and len(result) == 3
+
+    def test_base64_is_valid(self, camera_mcp):
+        b64_str, _, _ = camera_mcp._resize_and_encode(SAMPLE_JPEG_DATA)
+        # Should not raise
+        decoded = base64.b64decode(b64_str)
+        assert len(decoded) > 0
+
+    def test_original_size_matches_input(self, camera_mcp):
+        _, original, _ = camera_mcp._resize_and_encode(SAMPLE_JPEG_DATA)
+        # SAMPLE_JPEG_DATA is 800x600
+        assert original == (800, 600)
+
+    def test_large_image_is_downscaled(self, camera_mcp):
+        _, _, resized = camera_mcp._resize_and_encode(SAMPLE_JPEG_DATA, 640, 480)
+        assert resized[0] <= 640
+        assert resized[1] <= 480
+
+    def test_small_image_not_upscaled(self, camera_mcp):
+        """thumbnail() never upscales; 320x240 stays 320x240 with 640x480 budget."""
+        _, original, resized = camera_mcp._resize_and_encode(SAMPLE_JPEG_DATA_SMALL, 640, 480)
+        assert original == (320, 240)
+        assert resized == (320, 240)
+
+    def test_aspect_ratio_preserved(self, camera_mcp):
+        """800x600 resized to 640x480 should be 640x480 (exact fit)."""
+        _, original, resized = camera_mcp._resize_and_encode(SAMPLE_JPEG_DATA, 640, 480)
+        orig_ratio = original[0] / original[1]
+        res_ratio = resized[0] / resized[1]
+        assert abs(orig_ratio - res_ratio) < 0.02  # within 2% tolerance
+
+    def test_output_is_jpeg(self, camera_mcp):
+        """Re-encoded output must be a valid JPEG (starts with FF D8)."""
+        b64_str, _, _ = camera_mcp._resize_and_encode(SAMPLE_JPEG_DATA)
+        decoded = base64.b64decode(b64_str)
+        assert decoded[:2] == b"\xff\xd8", "Expected JPEG magic bytes"
+
+    def test_png_input_becomes_jpeg(self, camera_mcp):
+        """PNG input should be converted to JPEG on output."""
+        b64_str, _, _ = camera_mcp._resize_and_encode(SAMPLE_PNG_DATA)
+        decoded = base64.b64decode(b64_str)
+        assert decoded[:2] == b"\xff\xd8", "PNG input should produce JPEG output"
 
 # ---------------------------------------------------------------------------
 # Tests: camera_status
@@ -387,7 +524,7 @@ class TestCameraStatus:
         assert data["messages_received"] == 42
         assert data["has_image"] is True
         assert data["image_format"] == "jpeg"
-        assert data["image_size_bytes"] == len(SAMPLE_JPEG_DATA)
+        assert data["image_size_bytes"] == len(SAMPLE_IMAGE.data)  # raw bytes from msg, not resized
 
     def test_returns_status_without_image(self, camera_mcp):
         mock_node = MagicMock()
